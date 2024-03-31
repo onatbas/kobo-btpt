@@ -3,7 +3,7 @@
 
 #include <map>
 
-#include <linux/input-event-codes.h>
+#include <linux/input.h>
 
 #define VALUE(code) code
 #define MAP(code) map[#code] = VALUE(code)

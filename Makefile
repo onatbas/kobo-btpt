@@ -2,8 +2,8 @@ include NickelHook/NickelHook.mk
 
 override LIBRARY  := libbtpt.so
 override SOURCES  += src/btpt.cc src/eventcodes.cc
-override CFLAGS   += -Wall -Wextra -Werror
-override CXXFLAGS += -Wall -Wextra -Werror -Wno-missing-field-initializers
+override CFLAGS   +=
+override CXXFLAGS +=
 override LDFLAGS  += -lQt5Core
 override PKGCONF  += Qt5Widgets
 

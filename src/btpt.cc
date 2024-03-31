@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -19,8 +20,12 @@
 #include <QWidget>
 #include <QTextStream>
 #include <QThread>
+#include <QObject>
+#include <QVariant>
+#include <QMetaMethod>
 
 #include "btpt.h"
+#include "btpt_event.h"
 #include "eventcodes.h"
 
 /* Directory in which to look for device configuration */
@@ -28,6 +33,13 @@
 
 /* Stop Bluetooth heartbeat after this many seconds of inactivity */
 #define BLUETOOTH_TIMEOUT (10*60)
+
+#define NM_ACT_SYM(var, sym) reinterpret_cast<void*&>(var) = dlsym(RTLD_DEFAULT, sym)
+#define NM_ACT_XSYM(var, symb, err) do { \
+    NM_ACT_SYM(var, symb);               \
+    NM_CHECK(nullptr, var, err);         \
+} while(0)
+
 
 static void *(*BluetoothHeartbeat)(void *, long long);
 static void (*BluetoothHeartbeat_beat)(void *);
@@ -38,6 +50,92 @@ static QWidget *(*MainWindowController_currentView)(void *);
 static QObject *(*PowerManager_sharedInstance)();
 static int (*PowerManager_filter)(QObject *, QObject *, QEvent *);
 static QEvent::Type (*TimeEvent_eventType)();
+
+QMap<QString, btpt_event> event_map;
+
+bool invokeMethod(QString sharedInstanceFn, const QString& methodName, const QVariantList& args = {}, QVariant* returnValue = nullptr) {
+    nh_log("invokeMethod started");
+
+    typedef void SingletonInstanceType;
+    SingletonInstanceType *(*sharedInstance)();
+    nh_log(QString("About to call dlsym with sharedInstanceFn: %1").arg(sharedInstanceFn).toStdString().c_str());
+    sharedInstance = reinterpret_cast<SingletonInstanceType *(*)()>(dlsym(RTLD_DEFAULT, sharedInstanceFn.toStdString().c_str()));
+
+    if (!sharedInstance) {
+        nh_log(QString("Could not dlsym the shared instance : %1").arg(sharedInstanceFn).toStdString().c_str());
+        return false;
+    }
+
+
+    void (*method)(SingletonInstanceType *);
+	method = reinterpret_cast<void (*)(SingletonInstanceType *)>(dlsym(RTLD_DEFAULT, methodName.toStdString().c_str()));
+
+
+    if (!method) {
+        nh_log(QString("Could not dlsym the  method: %1").arg(methodName).toStdString().c_str());
+        return false;
+    }
+
+  nh_log("dlsym calls both succeeded, calling it");
+      void* obj = sharedInstance();
+     if (!obj) {
+        nh_log("sharedInstance returned nullptr");
+        return false;
+    }
+
+/* 
+    QGenericArgument arg[10]; // Qt supports up to 10 arguments
+    nh_log("Preparing QGenericArguments");
+    const int argsCount = qMin(args.size(), 10);
+    for (int i = 0; i < argsCount; ++i) {
+        arg[i] = QGenericArgument(args[i].typeName(), args[i].data());
+        nh_log(QString("Arg %1 of type %2 prepared").arg(i).arg(args[i].typeName()).toStdString().c_str());
+    }
+
+    QGenericReturnArgument ret;
+    QVariant retValue;
+    if (returnValue) {
+        nh_log("Setting up QGenericReturnArgument");
+        retValue = *returnValue;
+        ret = QGenericReturnArgument(returnValue->typeName(), returnValue->data());
+    }
+*/
+
+    nh_log(QString("Calling QMetaObject::invokeMethod with method: %1").arg(methodName).toStdString().c_str());
+ /*   bool success = QMetaObject::invokeMethod(obj, methodName.toUtf8().constData(),
+                                             Qt::DirectConnection,ret,
+                                             arg[0], arg[1], arg[2], arg[3],
+                                             arg[4], arg[5], arg[6], arg[7],
+                                             arg[8], arg[9]
+											 );
+x
+    if (success) {
+        nh_log("invokeMethod succeeded");
+    } else {
+        nh_log("invokeMethod failed\n");
+
+		const QMetaObject* meta = obj->metaObject();
+		nh_log(QString("Class: %1").arg(meta->className()).toStdString().c_str());
+		for(int i = meta->methodOffset(); i < meta->methodCount(); ++i) {
+			nh_log(meta->method(i).methodSignature().constData());
+		}
+
+		*/
+
+		method(obj);
+/*
+
+    if (returnValue && success) {
+        nh_log("Updating returnValue");
+        *returnValue = retValue;
+    }
+
+	*/
+
+    return true;
+}
+
+
 
 static void invokeMainWindowController(const char *method)
 {
@@ -109,7 +207,7 @@ bool BluetoothPageTurner::addDevice(
 	while (!in.atEnd()) {
 		/* Configuration file format is, one per line:
 		 *
-		 * METHOD TYPE CODE VALUE
+		 * METHOD TYPE CODE VALUE SHARED_INSTANCE(optional) PARAMS(optional)
 		 *
 		 * Invoke METHOD on MainWindowController when input event
 		 * matches TYPE, CODE, and VALUE.
@@ -120,17 +218,20 @@ bool BluetoothPageTurner::addDevice(
 
 		QString line = in.readLine();
 		QList<QString> parts = line.split(" ", QString::SkipEmptyParts);
-		if (parts.size() != 4) {
+		if (parts.size() < 4) {
 			nh_log("invalid config line: %s",
 			       line.toStdString().c_str());
 			devices.remove(uniq);
 			return false;
 		}
 
-		struct input_event event = { 0 };
+		struct btpt_event btpt_event;
+		btpt_event.method = parts[0];
+		btpt_event.event = input_event();
+
 		bool ok;
 
-		event.type = parseEventCode(&ok, parts[1]);
+		btpt_event.event.type = parseEventCode(&ok, parts[1]);
 		if (!ok) {
 			nh_log("invalid type: %s",
 			       parts[1].toStdString().c_str());
@@ -138,7 +239,7 @@ bool BluetoothPageTurner::addDevice(
 			return false;
 		}
 
-		event.code = parseEventCode(&ok, parts[2]);
+		btpt_event.event.code = parseEventCode(&ok, parts[2]);
 		if (!ok) {
 			nh_log("invalid code: %s",
 			       parts[2].toStdString().c_str());
@@ -146,7 +247,7 @@ bool BluetoothPageTurner::addDevice(
 			return false;
 		}
 
-		event.value = parseEventCode(&ok, parts[3]);
+		btpt_event.event.value = parseEventCode(&ok, parts[3]);
 		if (!ok) {
 			nh_log("invalid value: %s",
 			       parts[3].toStdString().c_str());
@@ -154,7 +255,15 @@ bool BluetoothPageTurner::addDevice(
 			return false;
 		}
 
-		QPair<struct input_event, QString> map(event, parts[0]);
+		if (parts.size() > 4)
+			btpt_event.shared_instance = parts[4]; //If any value is detected, it means the method is direct access.
+
+		for (auto i=5; i<parts.size(); i++){
+			btpt_event.params.push_back(parts[5]);
+		}
+
+		QPair<struct input_event, QString> map(btpt_event.event, btpt_event.toString());
+		event_map[btpt_event.toString()] = btpt_event;
 		device.cfg.append(map);
 	}
 
@@ -343,10 +452,37 @@ void BluetoothPageTurner::run()
 					/* Update PowerManager::timeLastUsed */
 					emit notify();
 
+					btpt_event event = event_map[pair.second];
 					/* Invoke the configured method */
-					const char *method = pair.second
-						.toStdString().c_str();
-					invokeMainWindowController(method);
+					if (event.shared_instance.size() == 0){
+						const char *method = event.method.toStdString().c_str();
+						invokeMainWindowController(method);
+					}else {
+						nh_log(QString("Not direct methods are not implemented yet.. %s.").arg(event.method).toStdString().c_str());
+
+						QVariantList args;
+						nh_log(QString("Preparing to decode %1 params").arg(event.params.size()).toStdString().c_str());
+						for (const QString &base64String : event.params) {
+							nh_log(QString("Decoding base64 param").toStdString().c_str());
+							// Decode the base64 string to QByteArray
+							QByteArray decodedBytes = QByteArray::fromBase64(base64String.toUtf8());
+							nh_log(QString("Decoded base64 string to QByteArray").toStdString().c_str());
+
+							// Convert QByteArray to QVariant and add to the arguments list
+							args.append(QVariant(decodedBytes));
+							nh_log(QString("Appended decoded param to args list").toStdString().c_str());
+						}
+
+						nh_log(QString("Calling invokeMethod with method: %1").arg(event.method).toStdString().c_str());
+						QVariant retValue;
+						bool success = invokeMethod(event.shared_instance, event.method, args, &retValue);
+						if (success) {
+							nh_log("invokeMethod call was successful");
+						} else {
+							nh_log("invokeMethod call failed");
+						}
+					}
+
 				}
 			}
 
